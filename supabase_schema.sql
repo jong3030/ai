@@ -1,0 +1,9 @@
+streamlit>=1.40.0
+pandas>=2.0.0
+pillow>=10.0.0
+pymupdf>=1.24.0
+scikit-learn>=1.4.0
+reportlab>=4.0.0
+python-pptx>=0.6.23
+openpyxl>=3.1.0
+supabase>=2.6.0

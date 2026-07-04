@@ -1,0 +1,53 @@
+create table if not exists materials (
+  id bigserial primary key,
+  school text,
+  grade text,
+  subject text,
+  material_type text,
+  material_name text,
+  importance integer default 50,
+  created_at timestamptz default now()
+);
+
+create table if not exists problems (
+  id bigserial primary key,
+  material_id bigint,
+  problem_kind text default 'material',
+  exam_name text,
+  page integer,
+  number text,
+  unit text,
+  type text,
+  difficulty text,
+  problem_text text,
+  solution_pattern text,
+  source_note text,
+  image_b64 text,
+  created_at timestamptz default now()
+);
+
+create table if not exists match_candidates (
+  id bigserial primary key,
+  exam_problem_id bigint,
+  candidate_problem_id bigint,
+  similarity real,
+  weighted_score real,
+  ai_grade text,
+  final_grade text,
+  status text default '후보',
+  use_in_report integer default 0,
+  case_order integer default 99,
+  reason text,
+  created_at timestamptz default now()
+);
+
+create table if not exists report_settings (
+  id bigserial primary key,
+  exam_name text unique,
+  title text,
+  overview text,
+  expected_cut text,
+  key_questions text,
+  study_guide text,
+  updated_at timestamptz default now()
+);

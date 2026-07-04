@@ -1,0 +1,702 @@
+import base64
+import io
+import os
+import re
+import sqlite3
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import fitz  # PyMuPDF
+import pandas as pd
+import streamlit as st
+from PIL import Image, ImageOps
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from pptx import Presentation
+from pptx.util import Inches, Pt
+
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
+APP_TITLE = "정영탁T 시험분석 AI 온라인 v3"
+BASE_DIR = Path(__file__).parent
+LOCAL_DB = BASE_DIR / "exam_analysis.sqlite"
+ASSET_DIR = BASE_DIR / "assets"
+OUTPUT_DIR = BASE_DIR / "outputs"
+ASSET_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+MATERIAL_WEIGHTS = {
+    "직보 테스트": 100,
+    "직보테스트": 100,
+    "시크릿": 90,
+    "교과서": 85,
+    "학교 부교재": 85,
+    "부교재": 85,
+    "파이널": 80,
+    "오버사": 80,
+    "스위치": 80,
+    "숙제": 70,
+    "모의고사 기출": 60,
+    "기출": 60,
+    "자체 제작": 50,
+    "외부문항": 50,
+}
+
+DIFFICULTIES = ["하", "중하", "중", "중상", "상", "최상"]
+DEFAULT_UNITS = ["공간좌표", "벡터의 연산", "벡터의 성분과 내적", "도형의 방정식", "미분계수와 도함수", "도함수의 활용", "수열", "확률", "통계", "기타"]
+
+# -----------------------------
+# Storage abstraction
+# -----------------------------
+
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+class Store:
+    def __init__(self):
+        self.supabase_url = get_secret("SUPABASE_URL", "")
+        self.supabase_key = get_secret("SUPABASE_SERVICE_KEY", "")
+        self.mode = "local"
+        self.sb = None
+        if self.supabase_url and self.supabase_key and create_client:
+            try:
+                self.sb = create_client(self.supabase_url, self.supabase_key)
+                self.mode = "supabase"
+            except Exception as e:
+                st.warning(f"Supabase 연결 실패. 임시 로컬 모드로 실행합니다: {e}")
+        if self.mode == "local":
+            self.conn = sqlite3.connect(LOCAL_DB, check_same_thread=False)
+            self.init_local()
+
+    def init_local(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+        create table if not exists materials (
+            id integer primary key autoincrement,
+            school text, grade text, subject text, material_type text, material_name text,
+            importance integer default 50, created_at text
+        )""")
+        cur.execute("""
+        create table if not exists problems (
+            id integer primary key autoincrement,
+            material_id integer,
+            problem_kind text default 'material',
+            exam_name text,
+            page integer,
+            number text,
+            unit text,
+            type text,
+            difficulty text,
+            problem_text text,
+            solution_pattern text,
+            source_note text,
+            image_b64 text,
+            created_at text
+        )""")
+        cur.execute("""
+        create table if not exists match_candidates (
+            id integer primary key autoincrement,
+            exam_problem_id integer,
+            candidate_problem_id integer,
+            similarity real,
+            weighted_score real,
+            ai_grade text,
+            final_grade text,
+            status text default '후보',
+            use_in_report integer default 0,
+            case_order integer default 99,
+            reason text,
+            created_at text
+        )""")
+        cur.execute("""
+        create table if not exists report_settings (
+            id integer primary key autoincrement,
+            exam_name text unique,
+            title text,
+            overview text,
+            expected_cut text,
+            key_questions text,
+            study_guide text,
+            updated_at text
+        )""")
+        self.conn.commit()
+
+    def insert(self, table: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        if self.mode == "supabase":
+            res = self.sb.table(table).insert(row).execute()
+            return res.data[0] if res.data else row
+        row = row.copy()
+        now = datetime.now().isoformat(timespec="seconds")
+        if table in ["materials", "problems", "match_candidates"] and "created_at" not in row:
+            row["created_at"] = now
+        if table == "report_settings" and "updated_at" not in row:
+            row["updated_at"] = now
+        cols = ",".join(row.keys())
+        qs = ",".join(["?"] * len(row))
+        cur = self.conn.cursor()
+        cur.execute(f"insert into {table} ({cols}) values ({qs})", list(row.values()))
+        self.conn.commit()
+        row["id"] = cur.lastrowid
+        return row
+
+    def select(self, table: str, where: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+        if self.mode == "supabase":
+            q = self.sb.table(table).select("*")
+            if where:
+                for k, v in where.items():
+                    q = q.eq(k, v)
+            res = q.execute()
+            return pd.DataFrame(res.data or [])
+        sql = f"select * from {table}"
+        vals = []
+        if where:
+            sql += " where " + " and ".join([f"{k}=?" for k in where.keys()])
+            vals = list(where.values())
+        return pd.read_sql_query(sql, self.conn, params=vals)
+
+    def delete_all(self, table: str):
+        if self.mode == "supabase":
+            # Supabase requires a filter; delete broad by id > 0
+            self.sb.table(table).delete().gt("id", 0).execute()
+        else:
+            self.conn.execute(f"delete from {table}")
+            self.conn.commit()
+
+    def update_row(self, table: str, row_id: int, updates: Dict[str, Any]):
+        if self.mode == "supabase":
+            self.sb.table(table).update(updates).eq("id", int(row_id)).execute()
+        else:
+            cols = ", ".join([f"{k}=?" for k in updates.keys()])
+            vals = list(updates.values()) + [int(row_id)]
+            self.conn.execute(f"update {table} set {cols} where id=?", vals)
+            self.conn.commit()
+
+store = Store()
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def img_to_b64(img: Image.Image, max_width: int = 1400) -> str:
+    img = img.convert("RGB")
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize((max_width, int(img.height * ratio)))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def b64_to_img(b64: str) -> Optional[Image.Image]:
+    if not b64:
+        return None
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    except Exception:
+        return None
+
+
+def uploaded_to_pages(uploaded_file) -> List[Image.Image]:
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    pages = []
+    if name.endswith(".pdf"):
+        doc = fitz.open(stream=data, filetype="pdf")
+        for page in doc:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            pages.append(img)
+    else:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        pages.append(ImageOps.exif_transpose(img))
+    return pages
+
+
+def crop_grid(img: Image.Image, rows: int, cols: int, margin_x: int = 0, margin_y: int = 0, gap_x: int = 0, gap_y: int = 0) -> List[Image.Image]:
+    w, h = img.size
+    inner_w = max(1, w - 2 * margin_x)
+    inner_h = max(1, h - 2 * margin_y)
+    cell_w = inner_w / cols
+    cell_h = inner_h / rows
+    crops = []
+    for r in range(rows):
+        for c in range(cols):
+            left = int(margin_x + c * cell_w + gap_x / 2)
+            top = int(margin_y + r * cell_h + gap_y / 2)
+            right = int(margin_x + (c + 1) * cell_w - gap_x / 2)
+            bottom = int(margin_y + (r + 1) * cell_h - gap_y / 2)
+            crops.append(img.crop((left, top, right, bottom)))
+    return crops
+
+
+def manual_crop(img: Image.Image, left_pct: float, top_pct: float, width_pct: float, height_pct: float) -> Image.Image:
+    w, h = img.size
+    l = int(w * left_pct / 100)
+    t = int(h * top_pct / 100)
+    r = int(min(w, l + w * width_pct / 100))
+    b = int(min(h, t + h * height_pct / 100))
+    return img.crop((l, t, r, b))
+
+
+def normalize_text(s: Any) -> str:
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def compose_search_text(row: pd.Series) -> str:
+    return " ".join([
+        normalize_text(row.get("unit", "")),
+        normalize_text(row.get("type", "")),
+        normalize_text(row.get("difficulty", "")),
+        normalize_text(row.get("problem_text", "")),
+        normalize_text(row.get("solution_pattern", "")),
+        normalize_text(row.get("source_note", "")),
+    ])
+
+
+def grade_from_score(score: float) -> str:
+    if score >= 0.82:
+        return "A 직접 적중"
+    if score >= 0.65:
+        return "B 구조 적중"
+    if score >= 0.45:
+        return "C 개념 적중"
+    return "D 제외"
+
+
+def material_priority(material_type: str) -> int:
+    return MATERIAL_WEIGHTS.get(str(material_type), 50)
+
+
+def ensure_report(exam_name: str):
+    df = store.select("report_settings", {"exam_name": exam_name})
+    if df.empty:
+        store.insert("report_settings", {
+            "exam_name": exam_name,
+            "title": f"{exam_name} 시험 분석",
+            "overview": "이번 시험은 교과서 기반 출제와 직전 대비 자료에서 다룬 핵심 구조가 함께 반영된 시험입니다. 문항별 출처와 난이도, 적중 여부를 바탕으로 향후 학습 방향을 정리합니다.",
+            "expected_cut": "예상 1등급 컷은 90점대 중후반으로 예상됩니다. 상위권 변별은 후반부 고난도 문항과 서답형에서 형성되었을 가능성이 큽니다.",
+            "key_questions": "주요 문항은 직보 테스트 및 시크릿 자료와 연결되는 문항, 그리고 후반부 변별 문항을 중심으로 선정합니다.",
+            "study_guide": "교과서 문항은 답만 외우는 것이 아니라 조건 변형과 풀이 구조를 함께 정리해야 합니다. 특히 공간좌표, 벡터, 내적, 자취 유형은 반복 훈련이 필요합니다.",
+        })
+
+
+def load_demo():
+    for t in ["match_candidates", "problems", "materials", "report_settings"]:
+        store.delete_all(t)
+    m1 = store.insert("materials", {"school":"세화여고","grade":"2","subject":"기하","material_type":"직보 테스트","material_name":"기하 직보 테스트 01","importance":100})
+    m2 = store.insert("materials", {"school":"세화여고","grade":"2","subject":"기하","material_type":"직보 테스트","material_name":"기하 직보 테스트 02","importance":100})
+    m3 = store.insert("materials", {"school":"세화여고","grade":"2","subject":"기하","material_type":"시크릿","material_name":"시크릿 기하 기말 세화여고","importance":90})
+    m4 = store.insert("materials", {"school":"세화여고","grade":"2","subject":"기하","material_type":"교과서","material_name":"미래엔 기하 교과서","importance":85})
+    demo_materials = [
+        (m1["id"], "4", "벡터", "세 점 일직선 위치벡터", "중", "평면 위 네 점 O,A,B,C의 위치벡터가 주어지고 세 점 A,B,C가 한 직선 위에 있도록 하는 m값", "직보 1회 4번"),
+        (m2["id"], "6", "벡터 자취", "단위벡터 자취 길이", "중상", "원 위의 점 P에 대해 OQ=OP/|OP|를 만족시키는 Q의 자취 길이", "직보 2회 6번"),
+        (m2["id"], "7", "구의 방정식", "세 좌표평면 접구", "중", "한 점을 지나고 xy, yz, zx평면에 동시에 접하는 구 2개의 반지름 합", "직보 2회 7번"),
+        (m1["id"], "13", "공간좌표", "정사영과 무게중심", "중상", "점 A, B의 정사영, BC 평행, 무게중심 조건으로 C좌표 계산", "직보 1회 13번"),
+        (m1["id"], "24", "위치벡터", "삼각형 넓이비", "상", "삼각형 변 위의 점과 벡터 조건을 이용해 넓이비를 구함", "직보 1회 서술형 24번"),
+        (m3["id"], "69", "공간좌표", "대칭이동 거리 최솟값", "중", "좌표평면 위의 점 P에 대해 AP+BP의 최솟값을 구함", "시크릿 69번"),
+        (m3["id"], "73", "구의 방정식", "세 좌표평면 접구", "중", "점 (2,4,10)을 지나고 세 좌표평면에 동시에 접하는 구의 반지름 합", "시크릿 73번"),
+        (m4["id"], "p.84", "공간좌표", "밀러 지수", "중상", "평면이 좌표축과 만나는 절편의 역수로 밀러 지수를 구함", "교과서 수학 이야기 밀러 지수"),
+    ]
+    for mid, num, unit, typ, diff, text, note in demo_materials:
+        store.insert("problems", {"material_id": mid, "problem_kind":"material", "page":1, "number":num, "unit":unit, "type":typ, "difficulty":diff, "problem_text":text, "solution_pattern":text, "source_note":note})
+    exam_material = store.insert("materials", {"school":"세화여고","grade":"2","subject":"기하","material_type":"실제 시험","material_name":"세화여고2 기하 기말","importance":100})
+    exam_rows = [
+        ("5", "벡터", "세 점 일직선 위치벡터", "중", "위치벡터가 주어진 세 점 A,B,C가 한 직선 위에 있도록 하는 실수 m값"),
+        ("9", "구의 방정식", "세 좌표평면 접구", "중", "한 점을 지나고 xy, yz, zx평면에 동시에 접하는 두 구의 반지름 합"),
+        ("12", "벡터 자취", "단위벡터 자취 길이", "중상", "원 위의 점 P에 대해 OQ=OP/|OP|를 만족시키는 점 Q의 자취 길이"),
+        ("13", "위치벡터", "삼각형 넓이비", "상", "삼각형 변 위의 점과 벡터 조건으로 넓이비를 구하는 문항"),
+        ("14", "공간좌표", "정사영과 무게중심", "중상", "정사영, 평행 조건, 무게중심 조건으로 좌표를 계산하는 문항"),
+        ("18", "구의 방정식", "구와 좌표평면 단면", "최상", "구가 세 좌표평면과 만나 생기는 단면원의 반지름 조건"),
+        ("서답1", "공간좌표", "대칭이동 거리 최솟값", "중", "xy평면 위의 점 P에 대해 AP+BP의 최솟값"),
+        ("서답5", "공간좌표", "밀러 지수", "중상", "좌표축 절편의 역수를 이용한 밀러 지수 문항"),
+    ]
+    for num, unit, typ, diff, text in exam_rows:
+        store.insert("problems", {"material_id": exam_material["id"], "problem_kind":"exam", "exam_name":"세화여고2 기하 기말", "page":1, "number":num, "unit":unit, "type":typ, "difficulty":diff, "problem_text":text, "solution_pattern":text, "source_note":"실제 시험"})
+    ensure_report("세화여고2 기하 기말")
+
+# -----------------------------
+# Analysis and output
+# -----------------------------
+
+def run_matching(exam_name: str, top_k: int = 5):
+    store.delete_all("match_candidates")
+    exam_df = store.select("problems", {"problem_kind":"exam"})
+    if exam_name:
+        exam_df = exam_df[exam_df["exam_name"].fillna("") == exam_name]
+    mat_df = store.select("problems", {"problem_kind":"material"})
+    materials = store.select("materials")
+    if exam_df.empty or mat_df.empty:
+        return 0
+    mat_df = mat_df.merge(materials[["id","material_type","material_name"]], left_on="material_id", right_on="id", how="left", suffixes=("", "_mat"))
+    exam_texts = [compose_search_text(r) for _, r in exam_df.iterrows()]
+    mat_texts = [compose_search_text(r) for _, r in mat_df.iterrows()]
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=1)
+    X = vectorizer.fit_transform(exam_texts + mat_texts)
+    sim = cosine_similarity(X[:len(exam_texts)], X[len(exam_texts):])
+    count = 0
+    for i, (_, erow) in enumerate(exam_df.iterrows()):
+        scores = sim[i]
+        cand_indices = scores.argsort()[::-1][:top_k]
+        for rank, idx in enumerate(cand_indices, start=1):
+            crow = mat_df.iloc[idx]
+            base = float(scores[idx])
+            weight = material_priority(crow.get("material_type", "")) / 100
+            weighted = base * 0.72 + weight * 0.28
+            ai_grade = grade_from_score(weighted)
+            reason = f"단원/유형/핵심구조 유사도 기반 후보. 자료 우선순위: {crow.get('material_type','')}."
+            store.insert("match_candidates", {
+                "exam_problem_id": int(erow["id"]),
+                "candidate_problem_id": int(crow["id"]),
+                "similarity": round(base, 4),
+                "weighted_score": round(weighted, 4),
+                "ai_grade": ai_grade,
+                "final_grade": ai_grade,
+                "status": "후보",
+                "use_in_report": 1 if rank == 1 and ai_grade != "D 제외" else 0,
+                "case_order": rank if rank == 1 else 99,
+                "reason": reason,
+            })
+            count += 1
+    return count
+
+
+def auto_approve_jikbo_first():
+    matches = store.select("match_candidates")
+    if matches.empty:
+        return 0
+    probs = store.select("problems")
+    mats = store.select("materials")
+    p = probs.merge(mats[["id","material_type","material_name"]], left_on="material_id", right_on="id", how="left", suffixes=("", "_mat"))
+    match_full = matches.merge(p[["id","number","material_type","material_name"]], left_on="candidate_problem_id", right_on="id", how="left", suffixes=("", "_cand"))
+    updated = 0
+    for exam_pid, group in match_full.groupby("exam_problem_id"):
+        group = group.copy()
+        group["priority"] = group["material_type"].map(material_priority).fillna(50)
+        group = group.sort_values(["priority", "weighted_score"], ascending=[False, False])
+        for order, (_, row) in enumerate(group.iterrows(), start=1):
+            use = 1 if order == 1 and row["final_grade"] != "D 제외" else 0
+            status = "대표 적중" if use else "보조/후보"
+            store.update_row("match_candidates", int(row["id"]), {"use_in_report": use, "status": status, "case_order": order if use else 99})
+            updated += 1
+    return updated
+
+
+def build_analysis_df(exam_name: str) -> pd.DataFrame:
+    probs = store.select("problems")
+    mats = store.select("materials")
+    exams = probs[(probs["problem_kind"] == "exam") & (probs["exam_name"].fillna("") == exam_name)]
+    matches = store.select("match_candidates")
+    if exams.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, e in exams.iterrows():
+        md = matches[(matches["exam_problem_id"] == e["id"]) & (matches["use_in_report"] == 1)] if not matches.empty else pd.DataFrame()
+        hit = ""
+        hit_grade = ""
+        hit_source = ""
+        if not md.empty:
+            m = md.sort_values("case_order").iloc[0]
+            c = probs[probs["id"] == m["candidate_problem_id"]]
+            if not c.empty:
+                c = c.iloc[0]
+                mat = mats[mats["id"] == c["material_id"]]
+                mat_name = mat.iloc[0]["material_name"] if not mat.empty else ""
+                mat_type = mat.iloc[0]["material_type"] if not mat.empty else ""
+                hit = f"{mat_name} {c.get('number','')}번"
+                hit_source = mat_type
+                hit_grade = m.get("final_grade", "")
+        rows.append({
+            "번호": e.get("number", ""),
+            "단원": e.get("unit", ""),
+            "유형": e.get("type", ""),
+            "난이도": e.get("difficulty", ""),
+            "시험문항 요약": e.get("problem_text", ""),
+            "대표 적중자료": hit,
+            "자료구분": hit_source,
+            "적중등급": hit_grade,
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_pdf(exam_name: str) -> Path:
+    ensure_report(exam_name)
+    settings = store.select("report_settings", {"exam_name": exam_name}).iloc[0]
+    analysis = build_analysis_df(exam_name)
+    path = OUTPUT_DIR / f"{exam_name}_분석지.pdf"
+    pdfmetrics.registerFont(UnicodeCIDFont('HYSMyeongJo-Medium'))
+    doc = SimpleDocTemplate(str(path), pagesize=A4, rightMargin=14*mm, leftMargin=14*mm, topMargin=14*mm, bottomMargin=14*mm)
+    styles = getSampleStyleSheet()
+    for s in styles.byName.values():
+        s.fontName = 'HYSMyeongJo-Medium'
+    story = []
+    story.append(Paragraph(settings.get("title") or f"{exam_name} 시험 분석", styles["Title"]))
+    story.append(Spacer(1, 6*mm))
+    for title, body in [("시험 총평", settings.get("overview","")), ("예상 등급컷", settings.get("expected_cut","")), ("주요 문항 소개", settings.get("key_questions","")), ("향후 공부 방향", settings.get("study_guide",""))]:
+        story.append(Paragraph(f"<b>{title}</b>", styles["Heading2"]))
+        story.append(Paragraph(str(body).replace("\n", "<br/>"), styles["BodyText"]))
+        story.append(Spacer(1, 4*mm))
+    if not analysis.empty:
+        story.append(Paragraph("문항별 분석표", styles["Heading2"]))
+        table_data = [analysis.columns.tolist()] + analysis.fillna("").astype(str).values.tolist()
+        # Trim long text for PDF table
+        table_data = [[cell[:80] + ("…" if len(cell)>80 else "") for cell in row] for row in table_data]
+        tbl = Table(table_data, repeatRows=1, colWidths=[16*mm, 28*mm, 35*mm, 18*mm, 45*mm, 40*mm, 20*mm, 25*mm])
+        tbl.setStyle(TableStyle([
+            ('FONT', (0,0), (-1,-1), 'HYSMyeongJo-Medium', 7),
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#111827')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('GRID', (0,0), (-1,-1), 0.25, colors.grey),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ]))
+        story.append(tbl)
+        story.append(PageBreak())
+        hits = analysis[analysis["대표 적중자료"].astype(str) != ""]
+        if not hits.empty:
+            story.append(Paragraph("대표 적중문항", styles["Heading2"]))
+            for _, r in hits.iterrows():
+                story.append(Paragraph(f"<b>{r['번호']}번</b> — {r['대표 적중자료']} ({r['적중등급']})", styles["Heading3"]))
+                story.append(Paragraph(f"유형: {r['유형']} / 난이도: {r['난이도']}<br/>요약: {r['시험문항 요약']}", styles["BodyText"]))
+                story.append(Spacer(1, 3*mm))
+    doc.build(story)
+    return path
+
+
+def generate_excel(exam_name: str) -> Path:
+    path = OUTPUT_DIR / f"{exam_name}_분석표.xlsx"
+    analysis = build_analysis_df(exam_name)
+    matches = store.select("match_candidates")
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        analysis.to_excel(writer, sheet_name="문항별 분석", index=False)
+        matches.to_excel(writer, sheet_name="적중 후보", index=False)
+        store.select("problems").to_excel(writer, sheet_name="전체 문항DB", index=False)
+    return path
+
+
+def generate_ppt(exam_name: str) -> Path:
+    ensure_report(exam_name)
+    settings = store.select("report_settings", {"exam_name": exam_name}).iloc[0]
+    analysis = build_analysis_df(exam_name)
+    path = OUTPUT_DIR / f"{exam_name}_분석PPT.pptx"
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    def add_title_slide(title, subtitle):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        bg = slide.background.fill
+        bg.solid(); bg.fore_color.rgb = __import__('pptx').dml.color.RGBColor(17,24,39)
+        tx = slide.shapes.add_textbox(Inches(0.7), Inches(1.8), Inches(12), Inches(1))
+        p = tx.text_frame.paragraphs[0]; p.text = title; p.font.size = Pt(36); p.font.bold=True; p.font.color.rgb=__import__('pptx').dml.color.RGBColor(255,255,255)
+        sub = slide.shapes.add_textbox(Inches(0.75), Inches(3.1), Inches(11.5), Inches(1.4))
+        p2 = sub.text_frame.paragraphs[0]; p2.text = subtitle; p2.font.size=Pt(18); p2.font.color.rgb=__import__('pptx').dml.color.RGBColor(229,231,235)
+    def add_text_slide(title, body):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        tx = slide.shapes.add_textbox(Inches(0.6), Inches(0.4), Inches(12.2), Inches(0.6))
+        p=tx.text_frame.paragraphs[0]; p.text=title; p.font.size=Pt(26); p.font.bold=True
+        bodybox=slide.shapes.add_textbox(Inches(0.8), Inches(1.4), Inches(11.8), Inches(5.5))
+        tf=bodybox.text_frame; tf.word_wrap=True
+        for i, line in enumerate(str(body).split('\n')):
+            para = tf.paragraphs[0] if i==0 else tf.add_paragraph()
+            para.text = line; para.font.size=Pt(18)
+    add_title_slide(settings.get("title") or exam_name, "시험 총평 · 예상 등급컷 · 주요문항 · 적중문항 분석")
+    add_text_slide("시험 총평", settings.get("overview", ""))
+    add_text_slide("예상 등급컷", settings.get("expected_cut", ""))
+    if not analysis.empty:
+        hits = analysis[analysis["대표 적중자료"].astype(str) != ""]
+        add_text_slide("대표 적중 요약", "\n".join([f"{r['번호']}번 → {r['대표 적중자료']} ({r['적중등급']})" for _, r in hits.head(8).iterrows()]))
+        for _, r in hits.head(6).iterrows():
+            add_text_slide(f"적중사례 | {r['번호']}번", f"유형: {r['유형']}\n난이도: {r['난이도']}\n대표 적중자료: {r['대표 적중자료']}\n판정: {r['적중등급']}\n\n{r['시험문항 요약']}")
+    prs.save(path)
+    return path
+
+# -----------------------------
+# UI
+# -----------------------------
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+st.caption(f"저장 모드: {'Supabase 온라인 DB' if store.mode=='supabase' else '임시 로컬 DB'}")
+
+menu = st.sidebar.radio("메뉴", [
+    "0. 대시보드/샘플",
+    "1. 자료·시험지 업로드/크롭",
+    "2. 문항 DB 수정",
+    "3. 적중 후보 검색·승인",
+    "4. 분석지 문구 편집",
+    "5. PDF/PPT/Excel 생성",
+])
+
+if menu == "0. 대시보드/샘플":
+    st.subheader("시작")
+    st.write("온라인 배포형 시험분석 웹앱입니다. 자료 문항 DB와 실제 시험 문항을 등록한 뒤 유사문항 후보를 찾고, PDF/PPT/Excel을 생성합니다.")
+    if store.mode == "local":
+        st.warning("현재는 임시 로컬 DB 모드입니다. Streamlit Cloud에서 장기간 운영하려면 Supabase secrets를 설정하세요.")
+    if st.button("세화여고2 기하 샘플 DB 초기화/로드", type="primary"):
+        load_demo(); st.success("샘플 데이터 로드 완료")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("자료", len(store.select("materials")))
+    col2.metric("문항", len(store.select("problems")))
+    col3.metric("적중 후보", len(store.select("match_candidates")))
+
+elif menu == "1. 자료·시험지 업로드/크롭":
+    st.subheader("자료·시험지 업로드/크롭")
+    st.write("PDF나 이미지를 올린 뒤, 페이지를 격자로 자동 분할하거나 수동 좌표로 잘라 문항 DB에 저장합니다.")
+    with st.form("upload_meta"):
+        c1, c2, c3, c4 = st.columns(4)
+        school = c1.text_input("학교", "세화여고")
+        grade = c2.text_input("학년", "2")
+        subject = c3.text_input("과목", "기하")
+        material_type = c4.selectbox("자료 종류", ["직보 테스트", "시크릿", "교과서", "학교 부교재", "숙제", "파이널", "오버사", "스위치", "모의고사 기출", "실제 시험", "자체 제작"])
+        material_name = st.text_input("자료명/시험명", "세화여고2 기하 기말")
+        exam_name = st.text_input("실제 시험이면 시험명", "세화여고2 기하 기말")
+        uploaded = st.file_uploader("PDF/JPG/PNG 업로드", type=["pdf", "jpg", "jpeg", "png"])
+        submit = st.form_submit_button("파일 읽기")
+    if submit and uploaded:
+        st.session_state["upload_meta"] = {"school":school,"grade":grade,"subject":subject,"material_type":material_type,"material_name":material_name,"exam_name":exam_name}
+        st.session_state["pages"] = uploaded_to_pages(uploaded)
+        st.success(f"{len(st.session_state['pages'])}개 페이지를 읽었습니다.")
+    pages = st.session_state.get("pages", [])
+    if pages:
+        page_idx = st.selectbox("페이지 선택", list(range(1, len(pages)+1))) - 1
+        img = pages[page_idx]
+        st.image(img, caption=f"페이지 {page_idx+1}", use_column_width=True)
+        mode = st.radio("크롭 방식", ["격자 자동 분할", "수동 좌표 크롭"])
+        meta = st.session_state["upload_meta"]
+        if mode == "격자 자동 분할":
+            c1,c2,c3,c4 = st.columns(4)
+            rows = c1.number_input("행", min_value=1, max_value=10, value=2)
+            cols = c2.number_input("열", min_value=1, max_value=5, value=2)
+            start_no = c3.text_input("시작 번호", "1")
+            margin = c4.number_input("상하좌우 여백(px)", min_value=0, max_value=500, value=0)
+            crops = crop_grid(img, int(rows), int(cols), margin, margin)
+            st.write("미리보기")
+            st.image(crops, width=250)
+            if st.button("이 페이지 크롭들을 문항 DB에 저장"):
+                mat = store.insert("materials", {"school":meta["school"],"grade":meta["grade"],"subject":meta["subject"],"material_type":meta["material_type"],"material_name":meta["material_name"],"importance":material_priority(meta["material_type"])})
+                for i, crop in enumerate(crops):
+                    no = str(int(start_no)+i) if str(start_no).isdigit() else f"{start_no}-{i+1}"
+                    kind = "exam" if meta["material_type"] == "실제 시험" else "material"
+                    store.insert("problems", {"material_id":mat["id"],"problem_kind":kind,"exam_name":meta["exam_name"] if kind=="exam" else None,"page":page_idx+1,"number":no,"unit":"","type":"","difficulty":"","problem_text":"","solution_pattern":"","source_note":"","image_b64":img_to_b64(crop)})
+                st.success("저장 완료. 2. 문항 DB 수정 메뉴에서 텍스트/단원/유형을 보정하세요.")
+        else:
+            c1,c2,c3,c4 = st.columns(4)
+            left = c1.slider("왼쪽 %", 0, 100, 0)
+            top = c2.slider("위 %", 0, 100, 0)
+            width = c3.slider("너비 %", 1, 100, 50)
+            height = c4.slider("높이 %", 1, 100, 35)
+            crop = manual_crop(img, left, top, width, height)
+            st.image(crop, caption="수동 크롭 결과", use_column_width=True)
+            no = st.text_input("문항 번호", "1")
+            if st.button("이 크롭 1개 저장"):
+                mat = store.insert("materials", {"school":meta["school"],"grade":meta["grade"],"subject":meta["subject"],"material_type":meta["material_type"],"material_name":meta["material_name"],"importance":material_priority(meta["material_type"])})
+                kind = "exam" if meta["material_type"] == "실제 시험" else "material"
+                store.insert("problems", {"material_id":mat["id"],"problem_kind":kind,"exam_name":meta["exam_name"] if kind=="exam" else None,"page":page_idx+1,"number":no,"unit":"","type":"","difficulty":"","problem_text":"","solution_pattern":"","source_note":"","image_b64":img_to_b64(crop)})
+                st.success("저장 완료")
+
+elif menu == "2. 문항 DB 수정":
+    st.subheader("문항 DB 수정")
+    probs = store.select("problems")
+    mats = store.select("materials")
+    if probs.empty:
+        st.info("등록된 문항이 없습니다.")
+    else:
+        merged = probs.merge(mats[["id","school","grade","subject","material_type","material_name"]], left_on="material_id", right_on="id", how="left", suffixes=("", "_mat"))
+        st.dataframe(merged[["id","problem_kind","exam_name","material_name","material_type","number","unit","type","difficulty","problem_text","solution_pattern","source_note"]], use_container_width=True)
+        pid = st.number_input("수정할 문항 ID", min_value=1, value=int(merged.iloc[0]["id"]))
+        row = merged[merged["id"] == pid]
+        if not row.empty:
+            r = row.iloc[0]
+            img = b64_to_img(r.get("image_b64", ""))
+            if img: st.image(img, caption=f"ID {pid} 문항 이미지", width=500)
+            with st.form("edit_problem"):
+                number = st.text_input("번호", str(r.get("number", "")))
+                unit = st.selectbox("단원", DEFAULT_UNITS + [str(r.get("unit", ""))], index=0 if not r.get("unit") else len(DEFAULT_UNITS))
+                typ = st.text_input("유형", str(r.get("type", "")))
+                diff = st.selectbox("난이도", DIFFICULTIES, index=DIFFICULTIES.index(r.get("difficulty")) if r.get("difficulty") in DIFFICULTIES else 2)
+                problem_text = st.text_area("문제 텍스트/OCR 결과", str(r.get("problem_text", "")), height=120)
+                pattern = st.text_area("핵심 구조/풀이 패턴", str(r.get("solution_pattern", "")), height=100)
+                source_note = st.text_input("출처/메모", str(r.get("source_note", "")))
+                if st.form_submit_button("문항 수정 저장", type="primary"):
+                    store.update_row("problems", pid, {"number":number,"unit":unit,"type":typ,"difficulty":diff,"problem_text":problem_text,"solution_pattern":pattern,"source_note":source_note})
+                    st.success("저장 완료")
+
+elif menu == "3. 적중 후보 검색·승인":
+    st.subheader("적중 후보 검색·승인")
+    exams = store.select("problems", {"problem_kind":"exam"})
+    exam_names = sorted([x for x in exams["exam_name"].dropna().unique()]) if not exams.empty else []
+    exam_name = st.selectbox("시험 선택", exam_names or ["세화여고2 기하 기말"])
+    c1,c2 = st.columns(2)
+    if c1.button("유사문항 후보 검색 실행", type="primary"):
+        n = run_matching(exam_name, top_k=5); st.success(f"후보 {n}개 생성")
+    if c2.button("직보 우선 자동 승인"):
+        n = auto_approve_jikbo_first(); st.success(f"{n}개 후보 우선순위 반영")
+    matches = store.select("match_candidates")
+    probs = store.select("problems")
+    mats = store.select("materials")
+    if not matches.empty:
+        ecols = probs[["id","number","unit","type","difficulty","problem_text"]].rename(columns={"id":"exam_problem_id","number":"시험번호","unit":"시험단원","type":"시험유형"})
+        cprobs = probs.merge(mats[["id","material_type","material_name"]], left_on="material_id", right_on="id", how="left", suffixes=("", "_mat"))
+        ccols = cprobs[["id","number","unit","type","problem_text","material_type","material_name"]].rename(columns={"id":"candidate_problem_id","number":"후보번호","unit":"후보단원","type":"후보유형"})
+        full = matches.merge(ecols, on="exam_problem_id", how="left").merge(ccols, on="candidate_problem_id", how="left")
+        display_cols = ["id","시험번호","시험단원","시험유형","material_type","material_name","후보번호","후보유형","similarity","weighted_score","final_grade","status","use_in_report","case_order","reason"]
+        edited = st.data_editor(full[display_cols].sort_values(["시험번호","case_order","weighted_score"], ascending=[True,True,False]), use_container_width=True, num_rows="fixed", key="matches_editor")
+        if st.button("적중 후보 수정사항 저장", type="primary"):
+            for _, r in edited.iterrows():
+                store.update_row("match_candidates", int(r["id"]), {"final_grade":r["final_grade"],"status":r["status"],"use_in_report":int(r["use_in_report"]),"case_order":int(r["case_order"]),"reason":r["reason"]})
+            st.success("저장 완료")
+
+elif menu == "4. 분석지 문구 편집":
+    st.subheader("분석지 문구 편집")
+    exams = store.select("problems", {"problem_kind":"exam"})
+    exam_names = sorted([x for x in exams["exam_name"].dropna().unique()]) if not exams.empty else ["세화여고2 기하 기말"]
+    exam_name = st.selectbox("시험 선택", exam_names)
+    ensure_report(exam_name)
+    s = store.select("report_settings", {"exam_name": exam_name}).iloc[0]
+    with st.form("report_form"):
+        title = st.text_input("보고서 제목", s.get("title", ""))
+        overview = st.text_area("시험 총평", s.get("overview", ""), height=160)
+        expected_cut = st.text_area("예상 등급컷", s.get("expected_cut", ""), height=120)
+        key_questions = st.text_area("주요 문항 소개", s.get("key_questions", ""), height=120)
+        study_guide = st.text_area("향후 공부 방향", s.get("study_guide", ""), height=150)
+        if st.form_submit_button("문구 저장", type="primary"):
+            store.update_row("report_settings", int(s["id"]), {"title":title,"overview":overview,"expected_cut":expected_cut,"key_questions":key_questions,"study_guide":study_guide,"updated_at":datetime.now().isoformat(timespec="seconds")})
+            st.success("저장 완료")
+
+elif menu == "5. PDF/PPT/Excel 생성":
+    st.subheader("PDF/PPT/Excel 생성")
+    exams = store.select("problems", {"problem_kind":"exam"})
+    exam_names = sorted([x for x in exams["exam_name"].dropna().unique()]) if not exams.empty else ["세화여고2 기하 기말"]
+    exam_name = st.selectbox("시험 선택", exam_names)
+    c1,c2,c3 = st.columns(3)
+    if c1.button("PDF 생성", type="primary"):
+        p = generate_pdf(exam_name)
+        st.success("PDF 생성 완료")
+        st.download_button("PDF 다운로드", p.read_bytes(), file_name=p.name, mime="application/pdf")
+    if c2.button("PPT 생성"):
+        p = generate_ppt(exam_name)
+        st.success("PPT 생성 완료")
+        st.download_button("PPT 다운로드", p.read_bytes(), file_name=p.name, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    if c3.button("Excel 생성"):
+        p = generate_excel(exam_name)
+        st.success("Excel 생성 완료")
+        st.download_button("Excel 다운로드", p.read_bytes(), file_name=p.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.divider()
+    st.write("미리보기")
+    st.dataframe(build_analysis_df(exam_name), use_container_width=True)
